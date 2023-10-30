@@ -1,18 +1,16 @@
-use std::{
-    net::{Ipv4Addr, SocketAddrV4},
-    sync::Arc,
-};
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use poem::{listener::TcpListener, EndpointExt, Route};
 use poem_openapi::OpenApiService;
-use tokio::sync::RwLock;
 
 mod api;
 mod data;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dataset = Arc::new(RwLock::new(data::dataset().await?));
+    pretty_env_logger::init();
+
+    let dataset = data::dataset().await?;
 
     let service =
         OpenApiService::new(api::Api, "Exchange rate API", "1.0").server("https://exchange.rates");
