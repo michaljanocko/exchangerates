@@ -2,3 +2,5 @@
 !.gitkeep
 
 /target
+
+heaptrack.exchangerates.*
