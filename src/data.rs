@@ -41,7 +41,7 @@ pub const EUR: Currency = "EUR";
 #[derive(Clone)]
 pub struct Dataset {
     pub days: Vec<Day>,
-    pub currencies: Vec<Currency>,
+    pub currencies: &'static [Currency],
 }
 
 impl Dataset {
@@ -66,7 +66,25 @@ pub struct Day {
 }
 
 impl Day {
-    pub fn to_hashmap(&self, currencies: Vec<Currency>) -> HashMap<String, Option<f64>> {
+    pub fn convert(self, from: &'static str, currencies: &'static [Currency]) -> Option<Self> {
+        if from == EUR {
+            return Some(self);
+        }
+
+        // Find the index of the base currency
+        let from = currencies.binary_search(&from).ok()?;
+        // Get the base currency rate
+        let from_rate = self.rates.get(from)?.as_ref()?.clone();
+        // Convert all the rates
+        let rates = self
+            .rates
+            .into_iter()
+            .map(|rate| rate.map(|r| r / from_rate))
+            .collect::<Vec<_>>();
+
+        Some(Self { rates, ..self })
+    }
+    pub fn to_hashmap(&self, currencies: &'static [Currency]) -> HashMap<String, Option<f64>> {
         currencies
             .into_iter()
             .map(ToString::to_string)
@@ -112,7 +130,6 @@ pub async fn dataset() -> anyhow::Result<SharedDataset> {
         }
     };
 
-    println!("{:?}", dataset.days.len());
     Ok(Arc::new(RwLock::new(dataset)))
 }
 
@@ -188,13 +205,13 @@ async fn parse_dataset(data: String) -> anyhow::Result<Dataset> {
         // Reverse the days so that the oldest day is first
         days.reverse();
 
-        Ok(Dataset {
-            days,
-            currencies: currencies
-                .into_iter()
-                .map(|c| -> &'static str { c.leak() })
-                .collect::<Vec<_>>(),
-        })
+        let currencies: &'static [&'static str] = currencies
+            .into_iter()
+            .map(|c| -> &'static str { c.leak() })
+            .collect::<Vec<_>>()
+            .leak();
+
+        Ok(Dataset { days, currencies })
     })
     .await?
 }

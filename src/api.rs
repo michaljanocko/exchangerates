@@ -1,15 +1,15 @@
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 
 use chrono::NaiveDate;
 use poem::web::Data;
 use poem_openapi::{
     payload::Json,
     types::{ToJSON, Type},
-    ApiResponse, Object, OpenApi, Union,
+    ApiResponse, Object, OpenApi,
 };
 use reqwest::StatusCode;
 
-use crate::data::{self, Currency, Day, SharedDataset};
+use crate::data::{self, Dataset, SharedDataset};
 
 pub struct Api;
 
@@ -19,7 +19,22 @@ struct IndexResponse {
     timeframe: [NaiveDate; 2],
 }
 
-#[derive(Object, Clone)]
+#[derive(Debug)]
+struct Conversion {
+    from: &'static str,
+    to: Vec<String>,
+}
+
+impl Default for Conversion {
+    fn default() -> Self {
+        Self {
+            from: data::EUR,
+            to: Vec::new(),
+        }
+    }
+}
+
+#[derive(Object, Clone, Debug)]
 struct ConversionParams {
     #[oai(validator(pattern = "^([A-Z]{3})$"))]
     from: Option<String>,
@@ -32,6 +47,67 @@ struct RatesRequest {
     date: Option<NaiveDate>,
     #[oai(flatten)]
     conversion: Option<ConversionParams>,
+}
+
+impl Conversion {
+    fn from_params(
+        params: &ConversionParams,
+        dataset: &Dataset,
+    ) -> Result<Self, CurrenciesNotFound> {
+        Ok(Self {
+            from: match params.from.as_ref() {
+                Some(from) => match dataset.from(&from) {
+                    // If we have a matching currency, return it
+                    Some(from) => from,
+                    // If not, return an error
+                    None => {
+                        return Err(CurrenciesNotFound {
+                            currencies_not_found: vec![from.clone()],
+                        })
+                    }
+                },
+                // If no currency has been provided, use EUR
+                None => data::EUR,
+            },
+            // If no `conversion.to` was specified, return an empty `Vec` → all currencies
+            to: {
+                let (to, not_found): (Vec<_>, Vec<_>) = params
+                    .to
+                    .as_ref()
+                    .unwrap_or(&Vec::new())
+                    .clone()
+                    .into_iter()
+                    .partition(|c| dataset.currencies.binary_search(&c.as_str()).is_ok());
+
+                if !not_found.is_empty() {
+                    return Err(CurrenciesNotFound {
+                        currencies_not_found: not_found,
+                    });
+                }
+
+                to
+            },
+        })
+    }
+}
+
+#[derive(Object)]
+struct Rates {
+    date: NaiveDate,
+    rates: HashMap<String, Option<f64>>,
+}
+
+#[derive(Object)]
+struct TimeframeRequest {
+    timeframe: [Option<NaiveDate>; 2],
+    #[oai(flatten)]
+    conversion: Option<ConversionParams>,
+}
+
+#[derive(Object)]
+struct Timeframe {
+    timeframe: [NaiveDate; 2],
+    rates: Vec<Rates>,
 }
 
 #[derive(ApiResponse)]
@@ -55,12 +131,6 @@ where
 struct CurrenciesNotFound {
     #[oai(skip_serializing_if_is_empty)]
     currencies_not_found: Vec<String>,
-}
-
-#[derive(Object)]
-struct DayRates {
-    date: NaiveDate,
-    rates: HashMap<String, Option<f64>>,
 }
 
 impl Api {
@@ -93,131 +163,150 @@ impl Api {
         &self,
         dataset: Data<&SharedDataset>,
         req: Json<Option<RatesRequest>>,
-    ) -> poem::Result<RatesResponse<DayRates>> {
+    ) -> poem::Result<RatesResponse<Rates>> {
         let dataset = dataset.read().await;
+        // let req = req.and_then(|r| r.0);
 
         // Try to extract the date from the request
         let index = req
             .as_ref()
             .and_then(|r| r.date)
             .map(|d| {
+                // Find the index of the day
                 dataset
                     .days
                     .binary_search_by_key(&d, |day| day.date)
-                    .unwrap_or_else(|e| e.checked_sub(1).unwrap_or(1))
+                    // We are using `.checked_sub` because if the dataset
+                    // is empty, we would run into an underflow
+                    .unwrap_or_else(|e| e.checked_sub(1).unwrap_or_default())
             })
-            .unwrap_or_else(|| dataset.days.len().checked_sub(1).unwrap_or(1));
+            // If that failed, use the last day
+            .unwrap_or_else(|| dataset.days.len().checked_sub(1).unwrap_or_default());
 
-        let mut day = dataset.days.get(index).ok_or_else(Api::no_rates)?.clone();
-
-        let from = req
+        let conversion = match req
             .as_ref()
-            .and_then(|r| r.conversion.clone())
-            .and_then(|r| r.from);
-
-        // Try to find the base currency
-        let from = match from {
-            Some(from) => match dataset.from(&from) {
-                Some(from) => from,
-                None => {
-                    return Ok(CurrenciesNotFound {
-                        currencies_not_found: vec![from],
-                    }
-                    .into())
-                }
-            },
-            None => data::EUR,
+            .and_then(|r| r.conversion.as_ref())
+            .map(|c| Conversion::from_params(&c, &dataset))
+        {
+            // Supplied → use it
+            Some(Ok(conversion)) => conversion,
+            // Error → return it
+            Some(Err(e)) => return Ok(e.into()),
+            // None → use default
+            None => Conversion::default(),
         };
 
-        day.rates = match (Conversion {
-            from,
-            currencies: dataset.currencies.clone(),
-        })
+        let day = dataset.days.get(index).ok_or_else(Api::no_rates)?.clone();
+
         // It actually makes sense to clone the rates here because returning
         // the values from the API is going to consume them anyway
-        .convert_day(day.rates.clone())
-        {
+        let day = match day.convert(conversion.from, dataset.currencies) {
             Some(converted) => converted,
             None => {
+                // We have validated this before but the base currency might
+                // not be available for the requested date
                 return Ok(CurrenciesNotFound {
-                    currencies_not_found: vec![from.to_string()],
+                    currencies_not_found: vec![conversion.from.to_string()],
                 }
-                .into())
+                .into());
             }
         };
 
-        let to = req
+        let mut rates = day.to_hashmap(dataset.currencies);
+
+        if !conversion.to.is_empty() {
+            rates = rates
+                .into_iter()
+                .filter(|(c, _)| conversion.to.contains(c))
+                .collect::<HashMap<_, _>>();
+        }
+
+        Ok(RatesResponse::Ok(Json(Rates {
+            date: day.date,
+            rates,
+        })))
+    }
+
+    #[oai(path = "/rates", method = "get")]
+    async fn rates_(&self, dataset: Data<&SharedDataset>) -> poem::Result<RatesResponse<Rates>> {
+        self.rates(dataset, Json(None)).await
+    }
+
+    #[oai(path = "/rates/timeframe", method = "post")]
+    async fn timeframe(
+        &self,
+        dataset: Data<&SharedDataset>,
+        req: Json<TimeframeRequest>,
+    ) -> poem::Result<RatesResponse<Timeframe>> {
+        let dataset = dataset.read().await;
+
+        let (start, end) = (
+            req.timeframe[0]
+                .map(|start| {
+                    dataset
+                        .days
+                        .binary_search_by_key(&start, |day| day.date)
+                        // If not found, take the previous day (or the first day)
+                        .unwrap_or_else(|e| e.checked_sub(1).unwrap_or_default())
+                })
+                // Otherwise, take the very first day
+                .unwrap_or(0),
+            req.timeframe[1]
+                .map(|end| {
+                    dataset
+                        .days
+                        .binary_search_by_key(&end, |day| day.date)
+                        // If not found, take the next day
+                        .unwrap_or_else(|e| e + 1)
+                })
+                // Otherwise, take the latest
+                .unwrap_or(dataset.days.len() - 1),
+        );
+
+        let days = dataset.days.get(start..end).ok_or_else(Api::no_rates)?;
+
+        let conversion = match req
+            .conversion
             .as_ref()
-            .and_then(|r| r.conversion.clone())
-            .and_then(|r| r.to)
-            .unwrap_or_default();
+            .map(|c| Conversion::from_params(&c, &dataset))
+        {
+            // Supplied → use it
+            Some(Ok(conversion)) => conversion,
+            // Error → return it
+            Some(Err(e)) => return Ok(e.into()),
+            // None → use default
+            None => Conversion::default(),
+        };
 
-        let currencies_not_found = to
-            .clone()
+        let rates = days
             .into_iter()
-            .filter(|c| dataset.currencies.binary_search(&c.as_str()).is_err())
+            .filter_map(|day| {
+                day.clone()
+                    .convert(conversion.from, dataset.currencies)
+                    .map(|rates| {
+                        let mut rates = rates.to_hashmap(dataset.currencies);
+
+                        if !conversion.to.is_empty() {
+                            rates = rates
+                                .into_iter()
+                                .filter(|(c, _)| conversion.to.contains(c))
+                                .collect::<HashMap<_, _>>();
+                        };
+
+                        Rates {
+                            date: day.date,
+                            rates,
+                        }
+                    })
+            })
             .collect::<Vec<_>>();
 
-        if currencies_not_found.is_empty() {
-            let mut rates = day.to_hashmap(dataset.currencies.clone());
-
-            if !to.is_empty() {
-                rates = rates
-                    .into_iter()
-                    .filter(|(c, _)| to.contains(c))
-                    .collect::<HashMap<_, _>>();
-            }
-
-            Ok(RatesResponse::Ok(Json(DayRates {
-                date: day.date,
-                rates,
-            })))
-        } else {
-            return Ok(CurrenciesNotFound {
-                currencies_not_found,
-            }
-            .into());
-        }
+        Ok(RatesResponse::Ok(Json(Timeframe {
+            timeframe: [
+                rates.first().map(|d| d.date).unwrap(),
+                rates.last().map(|d| d.date).unwrap(),
+            ],
+            rates,
+        })))
     }
-}
-
-struct Conversion {
-    pub from: &'static str,
-    pub currencies: Vec<&'static str>,
-}
-
-impl Conversion {
-    fn convert_day(&self, rates: Vec<Option<f64>>) -> Option<Vec<Option<f64>>> {
-        if self.from == data::EUR {
-            return Some(rates);
-        }
-
-        // Find the index of the base currency
-        let from = self.currencies.binary_search(&self.from).ok()?;
-        // Get the base currency rate
-        let from_rate = rates.get(from)?.as_ref()?;
-        // Convert all the rates
-        let rates = rates
-            .iter()
-            .map(|rate| rate.map(|r| r / from_rate))
-            .collect::<Vec<_>>();
-
-        Some(rates)
-    }
-
-    fn conver_days(&self) {
-        unimplemented!()
-    }
-
-    // fn convert(&self) -> Option<HashMap<String, f64>> {
-    //     let rates = self.convert_day()?;
-
-    //     Some(
-    //         self.currencies
-    //             .iter()
-    //             .zip(rates)
-    //             .filter_map(|(currency, rate)| rate.map(|r| (currency.to_string(), r)))
-    //             .collect::<HashMap<_, _>>(),
-    //     )
-    // }
 }
