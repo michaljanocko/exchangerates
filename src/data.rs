@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
+    env,
     sync::Arc,
+    time::Duration,
 };
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Timelike};
 use chrono_tz::Europe::Berlin;
 use serde::Deserialize;
 use tokio::{
@@ -20,24 +22,6 @@ pub type SharedDataset = Arc<RwLock<Dataset>>;
 pub type Currency = &'static str;
 pub const EUR: Currency = "EUR";
 
-// impl FromStr for Currency {
-//     type Err = anyhow::Error;
-
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         let mut chars = s.chars();
-
-//         return if let [Some(a), Some(b), Some(c)] = [chars.next(), chars.next(), chars.next()] {
-//             // The string is three characters long
-//             Ok(Self { code: [a, b, c] })
-//         } else {
-//             Err(anyhow::anyhow!(
-//                 "Currency codes are 3 characters long and {} is not",
-//                 s
-//             ))
-//         };
-//     }
-// }
-
 #[derive(Clone)]
 pub struct Dataset {
     pub days: Vec<Day>,
@@ -52,6 +36,7 @@ impl Dataset {
         Some([first.date, last.date])
     }
 
+    /// Convert a currency code to a static one from the dataset
     pub fn from(&self, from: &String) -> Option<&'static str> {
         let index = self.currencies.binary_search(&from.as_str()).ok()?;
 
@@ -62,11 +47,16 @@ impl Dataset {
 #[derive(Clone)]
 pub struct Day {
     pub date: NaiveDate,
+
+    /// List of rates for every currency in the dataset.
+    /// Currencies that did not exist at the time will be `None`
     pub rates: Vec<Option<f64>>,
 }
 
 impl Day {
     pub fn convert(self, from: &'static str, currencies: &'static [Currency]) -> Option<Self> {
+        // We do not need to convert if the base currency is EUR
+        // ECB publishes the rates with Euro as the base currency
         if from == EUR {
             return Some(self);
         }
@@ -84,6 +74,8 @@ impl Day {
 
         Some(Self { rates, ..self })
     }
+
+    /// Turns the day rates into a `HashMap` with currency codes as keys
     pub fn to_hashmap(&self, currencies: &'static [Currency]) -> HashMap<String, Option<f64>> {
         currencies
             .into_iter()
@@ -93,7 +85,7 @@ impl Day {
     }
 }
 
-async fn dataset_file() -> Option<File> {
+async fn cache_file() -> Option<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -104,10 +96,10 @@ async fn dataset_file() -> Option<File> {
 }
 
 pub async fn dataset() -> anyhow::Result<SharedDataset> {
-    let dataset = match dataset_file().await {
+    let dataset = match cache_file().await {
         // If we have no cached version of the dataset, download it
         None => download_dataset().await?,
-        // Otherwise, read, parse and return the cached version
+        // Otherwise, read, parse, and return the cached version
         Some(mut file) => {
             let mut data = String::new();
             file.read_to_string(&mut data).await?;
@@ -134,18 +126,50 @@ pub async fn dataset() -> anyhow::Result<SharedDataset> {
 }
 
 pub async fn schedule_dataset_update(dataset: SharedDataset) {
-    // tokio::spawn(async move {
-    //     loop {
-    //         let at = 1080;
-    //         let berlin_now = chrono::Utc::now().with_timezone(&Berlin);
-    //         let berlin_minute = berlin_now.hour() * 60 + berlin_now.minute();
+    let update_at = env::var("UPDATE_AT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        // ECB rates are usually updated at 16:00 CET, but we use 18:00 CET,
+        // just to be sure we actually get the newest rates
+        .unwrap_or(18 * 60);
 
-    //         if at == berlin_minute {
-    //             let mut lock = dataset.write().await;
-    //             *lock = download_dataset().await.unwrap_or(lock.clone());
-    //         }
-    //     }
-    // });
+    loop {
+        let berlin_now = chrono::Utc::now().with_timezone(&Berlin);
+        let berlin_minute = berlin_now.hour() * 60 + berlin_now.minute();
+
+        // Check if we need to wait until tomorrow to prevent integer overflow
+        let next_update_in = if berlin_minute >= update_at {
+            // If it has been 18:00 CET, wait until the next day
+            update_at - berlin_minute + 24 * 60
+        } else {
+            // Otherwise, wait until 18:00 CET today
+            update_at - berlin_minute
+        } as u64
+            * 60;
+
+        log::info!(
+            "Updates scheduled every day at {:02}:{:02} CET",
+            update_at / 60,
+            update_at % 60
+        );
+
+        log::debug!("Next update in {} seconds", next_update_in);
+        tokio::time::sleep(Duration::from_secs(next_update_in)).await;
+
+        if update_at == berlin_minute {
+            match download_dataset().await {
+                Ok(new_dataset) => {
+                    let mut lock = dataset.write().await;
+                    *lock = new_dataset
+                }
+                Err(e) => log::error!(
+                    "Failed to update dataset, using yesterday's\n{:ident$}",
+                    e,
+                    ident = 2
+                ),
+            }
+        }
+    }
 }
 
 async fn download_dataset() -> anyhow::Result<Dataset> {
@@ -153,12 +177,17 @@ async fn download_dataset() -> anyhow::Result<Dataset> {
 
     let response = reqwest::get(DATASET_HIST_URL).await?.text().await?;
 
-    if let Some(mut file) = dataset_file().await {
+    // Cache the response
+    if let Some(mut file) = cache_file().await {
         let _ = file.write_all(response.as_bytes()).await;
         let _ = file.flush().await;
     }
 
-    parse_dataset(response).await
+    let dataset = parse_dataset(response).await;
+
+    log::info!("Downloaded dataset");
+
+    dataset
 }
 
 async fn parse_dataset(data: String) -> anyhow::Result<Dataset> {
@@ -167,7 +196,7 @@ async fn parse_dataset(data: String) -> anyhow::Result<Dataset> {
 
         let mut currencies = HashSet::new();
 
-        // Fill the symbols `HashSet`
+        // Fill the currencies `HashSet`
         currencies.insert("EUR".to_string());
         for day in xml_document.data.days.iter() {
             for rate in day.rates.iter() {
@@ -184,16 +213,20 @@ async fn parse_dataset(data: String) -> anyhow::Result<Dataset> {
 
         let mut days = Vec::new();
 
+        // For every day,
         for mut xml_day in xml_document.data.days {
             let mut day = Day {
                 date: xml_day.date,
                 rates: vec![None; currencies.len()],
             };
 
+            // sort the rates,
             xml_day.rates.sort_by_key(|rate| rate.currency.clone());
 
+            // and set the Euro rate to 1.0,
             day.rates[eur_index] = Some(1.0);
             for rate in xml_day.rates {
+                // and then set all supported currencies
                 if let Ok(index) = currencies.binary_search(&&rate.currency) {
                     day.rates[index] = Some(rate.rate);
                 }
@@ -205,7 +238,8 @@ async fn parse_dataset(data: String) -> anyhow::Result<Dataset> {
         // Reverse the days so that the oldest day is first
         days.reverse();
 
-        let currencies: &'static [&'static str] = currencies
+        // Build a static slice of static currency codes
+        let currencies: &'static [&str] = currencies
             .into_iter()
             .map(|c| -> &'static str { c.leak() })
             .collect::<Vec<_>>()
