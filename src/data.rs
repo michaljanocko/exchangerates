@@ -140,7 +140,7 @@ pub async fn schedule_dataset_update(dataset: SharedDataset) {
         // Check if we need to wait until tomorrow to prevent integer overflow
         let next_update_in = if berlin_minute >= update_at {
             // If it has been 18:00 CET, wait until the next day
-            update_at - berlin_minute + 24 * 60
+            berlin_minute + 24 * 60 - update_at
         } else {
             // Otherwise, wait until 18:00 CET today
             update_at - berlin_minute
