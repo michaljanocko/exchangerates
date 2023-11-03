@@ -2,6 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use poem::{listener::TcpListener, EndpointExt, Route};
 use poem_openapi::OpenApiService;
+use tokio::signal::ctrl_c;
 
 mod api;
 mod data;
@@ -21,9 +22,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Route::new().nest("/", service.data(dataset));
 
-    let socket_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8000);
+    let socket_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 8000);
     poem::Server::new(TcpListener::bind(socket_addr))
-        .run(app)
+        .run_with_graceful_shutdown(app, async move { ctrl_c().await.unwrap_or(()) }, None)
         .await?;
 
     Ok(())
