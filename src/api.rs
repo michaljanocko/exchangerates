@@ -11,6 +11,7 @@ use reqwest::StatusCode;
 
 use crate::data::{self, Dataset, SharedDataset};
 
+#[derive(Clone, Copy)]
 pub struct Api;
 
 #[derive(Object)]
@@ -141,6 +142,7 @@ impl Api {
 
 #[OpenApi]
 impl Api {
+    /// Returns the list of available currencies and the timeframe of the dataset
     #[oai(path = "/", method = "get")]
     async fn index(&self, dataset: Data<&SharedDataset>) -> poem::Result<Json<IndexResponse>> {
         let dataset = dataset.read().await;
@@ -158,6 +160,7 @@ impl Api {
         }
     }
 
+    /// Returns the exchange rates for the given date
     #[oai(path = "/rates", method = "post")]
     async fn rates(
         &self,
@@ -165,23 +168,20 @@ impl Api {
         req: Json<Option<RatesRequest>>,
     ) -> poem::Result<RatesResponse<Rates>> {
         let dataset = dataset.read().await;
-        // let req = req.and_then(|r| r.0);
 
         // Try to extract the date from the request
-        let index = req
-            .as_ref()
-            .and_then(|r| r.date)
-            .map(|d| {
-                // Find the index of the day
-                dataset
-                    .days
-                    .binary_search_by_key(&d, |day| day.date)
-                    // We are using `.checked_sub` because if the dataset
-                    // is empty, we would run into an underflow
-                    .unwrap_or_else(|e| e.checked_sub(1).unwrap_or_default())
-            })
-            // If that failed, use the last day
-            .unwrap_or_else(|| dataset.days.len().checked_sub(1).unwrap_or_default());
+        let index = match req.as_ref().and_then(|r| r.date) {
+            // Find the index of the day if provided
+            Some(date) => dataset
+                .days
+                .binary_search_by_key(&date, |day| day.date)
+                // We are using `.checked_sub` because if the dataset
+                // is empty, we would run into an underflow
+                .unwrap_or_else(|e| e.checked_sub(1).unwrap_or_default()),
+
+            // Otherwise, use the latest day
+            None => dataset.days.len().checked_sub(1).unwrap_or_default(),
+        };
 
         let conversion = match req
             .as_ref()
