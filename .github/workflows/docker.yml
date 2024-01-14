@@ -13,7 +13,14 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      - name: Push the containers
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the container
         uses: docker/build-push-action@v5
         with:
           push: true
