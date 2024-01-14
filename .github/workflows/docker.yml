@@ -1,0 +1,21 @@
+name: Docker
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: ~
+
+jobs:
+  push_to_registries:
+    name: Publish Docker image to GitHub Container Registry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Push the containers
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}
