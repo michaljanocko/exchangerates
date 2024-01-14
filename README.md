@@ -1,12 +1,10 @@
 # 💱 Exchange rates API
 
-My favorite free exchange rates API was bought by evil corporate who wants me to pay for it. _"No! I can make my own,"_ I said. And so I did.
+My favorite free exchange rates API was bought by evil corporate who wants me to pay for it. Nope, thanks.
 
 ## Instalation
 
-`docker pull michaljanocko/exchangerates` and just run it! 🚀
-
-> The container is also published on [GitHub Container Registry](https://ghcr.io)
+`docker pull ghcr.io/michaljanocko/exchangerates` and just run it! 🚀
 
 You can also build it yourself:
 
